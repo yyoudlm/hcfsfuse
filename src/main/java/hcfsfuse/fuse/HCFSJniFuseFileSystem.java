@@ -1,15 +1,15 @@
 package hcfsfuse.fuse;
 
+import hcfsfuse.fuse.auth.AuthPolicy;
+import hcfsfuse.fuse.auth.AuthPolicyFactory;
+
 import alluxio.fuse.AlluxioFuseUtils;
 import alluxio.jnifuse.AbstractFuseFileSystem;
 import alluxio.jnifuse.ErrorCodes;
 import alluxio.jnifuse.struct.FileStat;
-import alluxio.jnifuse.struct.FuseContext;
 import alluxio.jnifuse.struct.FuseFileInfo;
-
 import alluxio.jnifuse.FuseFillDir;
 import alluxio.resource.LockResource;
-import alluxio.util.ThreadUtils;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.CacheBuilder;
@@ -32,7 +32,6 @@ import javax.annotation.concurrent.ThreadSafe;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Paths;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
@@ -63,6 +62,7 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
   private final Map<Long, FSDataInputStream> mOpenFileEntries = new ConcurrentHashMap<>();
   private final Map<Long, FSDataOutputStream> mCreateFileEntries = new ConcurrentHashMap<>();
   private final boolean mIsUserGroupTranslation;
+  private final AuthPolicy mAuthPolicy;
 
   // To make test build
   @VisibleForTesting
@@ -131,42 +131,13 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
           }
         });
     mIsUserGroupTranslation = true;
-  }
-
-  private void setUserGroupIfNeeded(Path uri) throws Exception {
-    FuseContext fc = getContext();
-    long uid = fc.uid.get();
-    long gid = fc.gid.get();
-
-    String gname = "";
-    String uname = "";
-    if (gid != DEFAULT_GID) {
-      String groupName = AlluxioFuseUtils.getGroupName(gid);
-      if (groupName.isEmpty()) {
-        // This should never be reached since input gid is always valid
-        LOG.error("Failed to get group name from gid {}, fallback to {}.", gid, GROUP_NAME);
-        groupName = GROUP_NAME;
-      }
-      gname = groupName;
-    }
-    if (uid != DEFAULT_UID) {
-      String userName = AlluxioFuseUtils.getUserName(uid);
-      if (userName.isEmpty()) {
-        // This should never be reached since input uid is always valid
-        LOG.error("Failed to get user name from uid {}, fallback to {}", uid, USER_NAME);
-        userName = USER_NAME;
-      }
-      uname = userName;
-    }
-    if (gid != DEFAULT_GID || uid != DEFAULT_UID) {
-      LOG.debug("Set attributes of path {} to {}, {}", uri, gid, uid);
-      mFileSystem.setOwner(uri, uname, gname);
-    }
+    mAuthPolicy = AuthPolicyFactory.create(mFileSystem, conf, this);
   }
 
   @Override
   public int create(String path, long mode, FuseFileInfo fi) {
-    return AlluxioFuseUtils.call(LOG, () -> createInternal(path, mode, fi),
+    return AlluxioFuseUtils.call(LOG, () ->
+            createInternal(path, mode, fi),
         "create", "path=%s,mode=%o", path, mode);
   }
 
@@ -183,7 +154,7 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
       long fid = mNextOpenFileId.getAndIncrement();
       mCreateFileEntries.put(fid, os);
       fi.fh.set(fid);
-      setUserGroupIfNeeded(uri);
+      mAuthPolicy.setUserGroupIfNeeded(uri);
     } catch (Throwable e) {
       LOG.error("Failed to create {}: ", path, e);
       return -ErrorCodes.EIO();
@@ -251,22 +222,22 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
   }
 
   @Override
-  public int readdir(String path, long buff, FuseFillDir filter, long offset,
+  public int readdir(String path, long buff, long filter, long offset,
       FuseFileInfo fi) {
     return AlluxioFuseUtils.call(LOG, () -> readdirInternal(path, buff, filter, offset, fi),
         "readdir", "path=%s,buf=%s", path, buff);
   }
 
-  private int readdirInternal(String path, long buff, FuseFillDir filter, long offset,
+  private int readdirInternal(String path, long buff, long filter, long offset,
       FuseFileInfo fi) {
     final Path uri = mPathResolverCache.getUnchecked(path);
     try {
       // standard . and .. entries
-      filter.apply(buff, ".", null, 0);
-      filter.apply(buff, "..", null, 0);
+      FuseFillDir.apply(filter, buff, ".", null, 0);
+      FuseFillDir.apply(filter, buff, "..", null, 0);
       final FileStatus[] ls = mFileSystem.listStatus(uri);
       for (FileStatus file : ls) {
-        filter.apply(buff, file.getPath().getName(), null, 0);
+        FuseFillDir.apply(filter, buff, file.getPath().getName(), null, 0);
       }
     } catch (Throwable e) {
       LOG.error("Failed to readdir {}: ", path, e);
@@ -283,11 +254,22 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
 
   private int openInternal(String path, FuseFileInfo fi) {
     final Path uri = mPathResolverCache.getUnchecked(path);
+    final int flags = fi.flags.get();
+    LOG.trace("open({}, 0x{}) [target: {}]", path, Integer.toHexString(flags), uri);
     try {
       long fd = mNextOpenFileId.getAndIncrement();
-      FSDataInputStream is = mFileSystem.open(uri);
-      mOpenFileEntries.put(fd, is);
-      fi.fh.set(fd);
+      if ((flags & 0b11) != 0) {
+        FSDataOutputStream os =
+            mFileSystem.create(uri);
+        long fid = mNextOpenFileId.getAndIncrement();
+        mCreateFileEntries.put(fid, os);
+        fi.fh.set(fid);
+        mAuthPolicy.setUserGroupIfNeeded(uri);
+      } else {
+        FSDataInputStream is = mFileSystem.open(uri);
+        mOpenFileEntries.put(fd, is);
+        fi.fh.set(fd);
+      }
       return 0;
     } catch (Throwable e) {
       LOG.error("Failed to open {}: ", path, e);
@@ -313,19 +295,21 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
         LOG.error("Cannot find fd {} for {}", fd, path);
         return -ErrorCodes.EBADFD();
       }
-      is.seek(offset);
-      final byte[] dest = new byte[sz];
-      while (rd >= 0 && nread < size) {
-        rd = is.read(dest, nread, sz - nread);
-        if (rd >= 0) {
-          nread += rd;
+      if (offset - is.getPos() < is.available()) {
+        is.seek(offset);
+        final byte[] dest = new byte[sz];
+        while (rd >= 0 && nread < size) {
+          rd = is.read(dest, nread, sz - nread);
+          if (rd >= 0) {
+            nread += rd;
+          }
         }
-      }
 
-      if (nread == -1) { // EOF
-        nread = 0;
-      } else if (nread > 0) {
-        buf.put(dest, 0, nread);
+        if (nread == -1) { // EOF
+          nread = 0;
+        } else if (nread > 0) {
+          buf.put(dest, 0, nread);
+        }
       }
     } catch (Throwable e) {
       LOG.error("Failed to read, path: {} size: {} offset: {}", path, size, offset, e);
@@ -419,7 +403,7 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
     }
     try {
       mFileSystem.mkdirs(uri, new FsPermission((int) mode));
-      setUserGroupIfNeeded(uri);
+      mAuthPolicy.setUserGroupIfNeeded(uri);
     } catch (Throwable e) {
       LOG.error("Failed to mkdir {}: ", path, e);
       return -ErrorCodes.EIO();
@@ -543,9 +527,12 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
       } else if (userName.isEmpty()) {
         LOG.info("Change group of file {} to {}", path, groupName);
         mFileSystem.setOwner(uri, null, groupName);
-      } else {
-        LOG.info("Change owner of file {} to {}", path, userName);
+      } else if (groupName.isEmpty()) {
+        LOG.info("Change user of file {} to {}", path, userName);
         mFileSystem.setOwner(uri, userName, null);
+      } else {
+        LOG.info("Change owner of file {} to {}:{}", path, userName, groupName);
+        mFileSystem.setOwner(uri, userName, groupName);
       }
     } catch (Throwable t) {
       LOG.error("Failed to chown {} to uid {} and gid {}", path, uid, gid, t);
@@ -556,8 +543,7 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
 
   @Override
   public int truncate(String path, long size) {
-    LOG.error("Truncate is not supported {}", path);
-    return -ErrorCodes.EOPNOTSUPP();
+    return 0;
   }
 
   /**
@@ -566,22 +552,6 @@ public final class HCFSJniFuseFileSystem extends AbstractFuseFileSystem {
   @Override
   public String getFileSystemName() {
     return mFsName;
-  }
-
-  @Override
-  public void mount(boolean blocking, boolean debug, String[] fuseOpts) {
-    LOG.info("Mounting HCFSJniFuseFileSystem: blocking={}, debug={}, fuseOpts=\"{}\"",
-        blocking, debug, Arrays.toString(fuseOpts));
-    super.mount(blocking, debug, fuseOpts);
-    LOG.info("HCFSJniFuseFileSystem mounted: blocking={}, debug={}, fuseOpts=\"{}\"",
-        blocking, debug, Arrays.toString(fuseOpts));
-  }
-
-  @Override
-  public void umount() {
-    LOG.info("Umount HCFSJniFuseFileSystem, {}",
-        ThreadUtils.formatStackTrace(Thread.currentThread()));
-    super.umount();
   }
 
   @VisibleForTesting
